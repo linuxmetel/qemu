@@ -103,6 +103,13 @@ void vfio_mask_single_irqindex(VFIODevice *vbasedev, int index)
     ioctl(vbasedev->fd, VFIO_DEVICE_SET_IRQS, &irq_set);
 }
 
+uint64_t corblbase = 0;
+uint64_t rirblbase = 0;
+uint64_t last_corbwp = 0;
+uint64_t last_rirbwp = 0;
+uint64_t corbs[1000] = { 0 };
+uint64_t rirbs[1000] = { 0 };
+
 static inline const char *action_to_str(int action)
 {
     switch (action) {
@@ -237,6 +244,34 @@ void vfio_region_write(void *opaque, hwaddr addr,
         break;
     }
 
+    if (region->nr == 0 && addr == 0x40) {
+        printf("CORBLBASE write of 0x%" PRIx64 "\n", data);
+        corblbase = data;
+    } else if (region->nr == 0 && addr == 0x50) {
+        printf("RIRBLBASE write of 0x%" PRIx64 "\n", data);
+        rirblbase = data;
+    } else if (region->nr == 0 && addr == 0x48) {
+        uint8_t buf[16];
+        uint64_t x;
+
+        printf("CORBWP advance to %ld, last WP %ld\n", data, last_corbwp);
+
+        for (x = last_corbwp + 1; x <= data; x++) {
+            uint64_t dmaaddr = corblbase + (x * 4);
+
+            cpu_physical_memory_read(dmaaddr, buf, 4);
+            corbs[x] = (uint32_t)ldl_p(buf);
+
+            printf("CORB[%ld] = 0x%" PRIx64 " (caddr:0x%lx nid:0x%lx "
+                "control:0x%lx param:0x%lx)\n",
+                x,
+                corbs[x],
+                ((corbs[x] >> 28) & 0xf), ((corbs[x] >> 20) & 0x7f),
+                ((corbs[x] >> 8) & 0xfff), (corbs[x] & 0xff));
+        }
+        last_corbwp = data;
+    }
+
     if (pwrite(vbasedev->fd, &buf, size, region->fd_offset + addr) != size) {
         error_report("%s(%s:region%d+0x%"HWADDR_PRIx", 0x%"PRIx64
                      ",%d) failed: %m",
@@ -292,6 +327,30 @@ uint64_t vfio_region_read(void *opaque,
     default:
         hw_error("vfio: unsupported read size, %u bytes", size);
         break;
+    }
+
+    if (region->nr == 0 && addr == 0x58) {
+        uint8_t buf[16];
+        uint64_t x;
+
+        printf("RIRBWP advance to %ld, last WP %ld\n", data, last_rirbwp);
+
+        for (x = last_rirbwp + 1; x <= data; x++) {
+            uint64_t dmaaddr = rirblbase + (x * 8);
+
+            cpu_physical_memory_read(dmaaddr, buf, 4);
+            rirbs[x] = (uint32_t)ldl_p(buf);
+
+            printf("CORB caddr:0x%lx nid:0x%lx control:0x%lx param:0x%lx "
+                "response:0x%lx",
+                ((corbs[x] >> 28) & 0xf), ((corbs[x] >> 20) & 0x7f),
+                ((corbs[x] >> 8) & 0xfff), (corbs[x] & 0xff),
+                rirbs[x]);
+
+            cpu_physical_memory_read(dmaaddr + 4, buf, 4);
+            printf(" (ex 0x%x)\n", (uint32_t)ldl_p(buf));
+        }
+        last_rirbwp = data;
     }
 
     trace_vfio_region_read(vbasedev->name, region->nr, addr, size, data);
